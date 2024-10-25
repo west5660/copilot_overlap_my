@@ -1,0 +1,129 @@
+import asyncio
+import os
+from collections import defaultdict
+from pprint import pprint
+from urllib.parse import urlparse
+
+from crowd_sdk.tagme import TagmeClientAdvanced
+from crowd_sdk.tagme.http_client.datacls import ItemStat
+
+
+class TaskHandler:
+    def __init__(self, url: str):
+        self.url = url
+        self._host = urlparse(url).netloc
+        self._org_id = urlparse(url).path.split('/')[2]
+        self._project_id = urlparse(url).path.split('/')[4]
+        self._task_id = urlparse(url).path.split('/')[6]
+
+        # Настройка клиента с конфигурацией
+        self.client = TagmeClientAdvanced(self.get_config_path())
+
+    def get_config_path(self):
+        """Определяем путь до конфигурационного файла в зависимости от сервера"""
+        if self._host == 'tagme.apps.prom-gen.sigma.sbrf.ru':
+            return os.path.expanduser('~/configs/.sigma.cfg')
+        elif self._host == 'tagme.sberdevices.ru':
+            return os.path.expanduser('~/configs/.cloud.cfg')
+        else:
+            raise ValueError("Unknown host")
+
+    async def create_task(self):
+        """Получаем информацию о проекте и таске, а затем группируем результаты по item_id"""
+        # Получаем информацию о проекте
+        print(f"Получаем проект {self._project_id} в организации {self._org_id}")
+        project = await self.client.get_project(project_id=self._project_id, organization_id=self._org_id)
+
+        # Получаем информацию о таске
+        print(f"Получаем таск {self._task_id}")
+        task = await self.client.get_task_files(task_id=self._task_id, organization_id=self._org_id)
+        pprint(task)
+        # Получаем результаты разметки по таску
+        print("Получаем результаты разметки по таску")
+        task_results = await self.client.get_task_assignments(task_id=self._task_id, organization_id=self._org_id)
+        pprint(task_results)
+
+        # Группируем результаты по item_id
+        print("Группируем результаты разметки по item_id")
+        grouped_results = defaultdict(list)
+        for task_result in task_results:
+            grouped_results[task_result.item_id].append(task_result)
+
+        # Обрабатываем каждую группу
+        for item_id, results in grouped_results.items():
+            print(f"Обрабатываем item_id: {item_id}, количество результатов: {len(results)}")
+            await self.process_item(item_id, results)
+
+    async def process_item(self, uid, results):
+        """Обработка каждого item, проверка на согласованность, изменение перекрытия при необходимости"""
+        # Создание экземпляра ItemStat для данного item
+        item_stat = ItemStat(
+            task_overlap=await self.get_task_overlap(uid),
+            in_progress=sum(1 for r in results if r.status == 'in_progress'),
+            in_review=sum(1 for r in results if r.status == 'in_review'),
+            rejected=sum(1 for r in results if r.status == 'rejected'),
+            accepted=sum(1 for r in results if r.status == 'accepted')
+        )
+
+        print(f"Статистика для item {uid}: {item_stat}")
+
+        # Проверка на согласованность разметок
+        if len(results) >= 3:
+            consistent = await self.check_consistency(results)
+            if not consistent:
+                print(f"Item {uid} имеет несогласованности, увеличиваем перекрытие.")
+                await self.change_overlap(uid, item_stat.task_overlap + 1)
+
+    async def check_consistency(self, results):
+        """Проверка согласованности разметок по item"""
+        message_marks = defaultdict(list)
+
+        for result in results:
+            marks = result.result['new_dialogue']['marks']
+
+            for mark in marks:
+                message_id = mark['messageId']
+                radio_1 = mark['fields']['radio_1']['value']
+                radio_2 = mark['fields']['radio_2']['value']
+                radio_3 = mark['fields']['radio_3']['value']
+
+                message_marks[message_id].append((radio_1, radio_2, radio_3))
+
+        # Проверяем, если для одного messageId разные метки
+        for message_id, values in message_marks.items():
+            if len(set(values)) > 1:
+                print(f"Inconsistent values for messageId: {message_id}")
+                return False
+        return True
+
+    async def get_task_overlap(self, uid):
+        """Получение текущего перекрытия для item"""
+        # Здесь нужно использовать метод для получения текущего перекрытия
+        return await self.client.client.get_task_files(task_id=self._task_id, item_id=uid, organization_id=self._org_id)
+
+    async def change_overlap(self, item_id, new_overlap):
+        """Изменение перекрытия для item"""
+        print(f"Изменение перекрытия для item_id: {item_id}")
+        result = await self.client.put_item_overlap(
+            task_id=self._task_id,
+            item_id=item_id,
+            overlap=new_overlap,
+            organization_id=self._org_id
+        )
+        print(f"Увеличено перекрытие для item {item_id}. Новое перекрытие: {new_overlap}")
+        return result
+
+
+async def main():
+    # Получаем ссылку на проект от пользователя
+    project_url = input("Введите ссылку на проект для загрузки: ")
+
+    # Создаем объект TaskHandler для обработки задач
+    handler = TaskHandler(project_url)
+
+    # Запускаем процесс создания таска и обработки items
+    await handler.create_task()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
